@@ -56,7 +56,8 @@ def epoch_run_override(self, dataloader, _logs=None):
     loss_meter = AverageValueMeter()
     metrics_meters = {metric.__name__: AverageValueMeter()
                       for metric in self.metrics}
-
+    if _logs is not None:
+        _logs.clear()
     with tqdm(dataloader, desc=self.stage_name,
               file=sys.stdout, disable=not (self.verbose)) as iterator:
         for item in iterator:
@@ -89,8 +90,6 @@ def epoch_run_override(self, dataloader, _logs=None):
 
 
 def train_batch_update_with_logs(self, x, y, logs=None):
-    if logs is not None:
-        logs.clear()
     self.optimizer.zero_grad()
     prediction = self.model.forward(x)
 
@@ -101,8 +100,6 @@ def train_batch_update_with_logs(self, x, y, logs=None):
 
 
 def valid_batch_update_with_logs(self, x, y, logs=None):
-    if logs is not None:
-        logs.clear()
     with torch.no_grad():
         prediction = self.model.forward(x)
         loss = self.loss(prediction, y, logs=logs)
