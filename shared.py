@@ -435,7 +435,8 @@ class Trainer:
             self.train_loader, _logs=logs)
         self.valid_step = lambda logs: self.valid_epoch.run(
             self.valid_loader, _logs=logs)
-        self.step = lambda logs, valid: self.train_step(logs) if not valid else self.valid_step(logs)
+        self.step = lambda logs, valid: self.train_step(
+            logs) if not valid else self.valid_step(logs)
         self.train_logs = {}
         self.valid_logs = {}
 
@@ -450,7 +451,8 @@ class Trainer:
             self.train_loss_logs = {}
         partial_logs = {key: partial_logs[key].mean for key in partial_logs}
         logs[step] = {'partial losses': partial_logs, 'main logs': step_logs}
-        self.main_logger.update(step=step, logs=logs[step]['main logs'], valid=valid)
+        self.main_logger.update(
+            step=step, logs=logs[step]['main logs'], valid=valid)
         self.partial_losses_logger.update(
             step, logs[step]['partial losses'], valid=valid)
 
