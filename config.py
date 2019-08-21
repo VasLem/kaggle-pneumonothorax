@@ -4,13 +4,15 @@ import random
 import torch
 import numpy as np
 
-CONFIG = Config(train_size=4000,
+CONFIG = Config(train_size=2000,
+                train_selection='hi_weight',
+                train_replacement=True,
                 valid_size=500,  # by random selection, will not participate at all in training
-                batch_size=2,
+                batch_size=4,
                 valid_batch_size=6,
                 random_seed=42,
-                lr=1e-3,
-                momentum=1,
+                lr=1e-2,
+                momentum=0.9,
                 restart_period=50,
                 weight_decay=0.01,
                 im_size=256,

@@ -9,16 +9,15 @@ import numpy as np
 import pandas as pd
 import segmentation_models_pytorch as smp
 import torch
-from numpy.random import choice
-from torch import nn
 from torch.utils.data import Dataset
 from torchnet.meter import AverageValueMeter
 from tqdm import tqdm_notebook as tqdm
 
 from config import CONFIG
-from custom_pytorch.custom_logs.segmentation import Logger
-from custom_pytorch.custom_samplers import SubsetRandomSampler
+from custom_pytorch.custom_logs import Logger
 from custom_pytorch.custom_utils import check_stage
+from custom_pytorch.custom_utils.train import Trainer as _Trainer
+from custom_pytorch.custom_utils.test import Tester as _Tester
 from transformations import handle_transformations
 
 CURR_FILE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -262,7 +261,7 @@ def get_dataset(stage):
         stage,
         train=PneumothoraxDataset(TRAIN_PATH, 'train'),
         valid=PneumothoraxDataset(
-            TRAIN_PATH, 'valid', apply_augmentation=False),
+            TRAIN_PATH, 'valid'),
         test=PneumothoraxDataset(TEST_PATH, 'test', apply_augmentation=False))
 
 
@@ -277,172 +276,33 @@ def get_weights(train_dataset):
     return weights
 
 
-def get_indices(stage, dataset, weights):
-    if stage != 'test':
-        valid_indices = choice(
-            len(dataset), size=CONFIG.valid_size,
-            replace=False, p=weights/np.sum(weights))
-        train_indices = np.setdiff1d(range(len(dataset)), valid_indices)
-        assert len(train_indices) + len(valid_indices) == len(dataset)
-        return train_indices, valid_indices
-    else:
-        return range(len(dataset))
-
-
-def get_sampler(stage, dataset, weights, indices):
-    def valid_sampler():
-        if weights is None:
-            return None
-        return SubsetRandomSampler(indices, replacement=False,
-                                   p=weights[indices]/np.sum(weights[indices]))
-
-    def train_sampler():
-        if weights is None:
-            return None
-        if CONFIG.train_size == 'all':
-            np.random.shuffle(indices)
-            CONFIG.train_size = len(indices)
-            return SubsetRandomSampler(indices, replacement=False)
-        # Negating replacement, so that more samples can be viewed per batch
-        return SubsetRandomSampler(indices, replacement=False,
-                                   num_samples=CONFIG.train_size,
-                                   p=weights[indices]/np.sum(weights[indices]))
-
-    def test_sampler():
-        return None
-    return check_stage(
-        stage, train=train_sampler(), test=test_sampler(), valid=valid_sampler()
-    )
-
-
-def get_loader(stage, dataset, sampler):
-    return check_stage(
-        stage, train=torch.utils.data.DataLoader(
-            dataset, batch_size=CONFIG.batch_size, sampler=sampler,
-            collate_fn=collate_fn, pin_memory=False,
-            drop_last=False, timeout=0, worker_init_fn=None),
-        valid=torch.utils.data.DataLoader(
-            dataset, batch_size=CONFIG.valid_batch_size, sampler=sampler,
-            collate_fn=collate_fn, pin_memory=False,
-            drop_last=False, timeout=0, worker_init_fn=None),
-        test=torch.utils.data.DataLoader(
-            dataset, batch_size=CONFIG.batch_size, shuffle=False,
-            collate_fn=collate_fn)
-    )
-
-
 def compare_with_low_thres(inp, thres):
     return inp <= CONFIG.im_size ** 2 * thres
 
 
-class BatchesOperator:
-
-    def __init__(
-            self, stage, model, loss_function, metric_functions,
-            device):
-        self.stage = stage
-        self.model = model
-        self.logs = {}
-        self.loss_function = lambda x, y: loss_function(x, y, logs=self.logs)
-        try:
-            metric_functions[0]
-        except TypeError:
-            metric_functions = [metric_functions]
-        self.metric_functions = metric_functions
-        self.use_cuda = device.startswith('cuda')
-
-    def train_or_valid(self, batch, valid=False):
-        if valid:
-            self.model.eval()
-        else:
-            self.model.train()
-        images = batch['images']
-        masks = batch['masks']
-        if self.use_cuda:
-            images = images.cuda()
-            masks = masks.cuda()
-        out = self.model(images)
-
-        class DummyContext:
-            def __enter__(self, *args, **kwargs):
-                return
-
-            def __exit__(self, *args, **kwargs):
-                return
-        if valid:
-            context = torch.no_grad
-        else:
-            context = DummyContext
-        with context():
-            loss = self.loss_function(out, masks)
-            metrics = []
-            for func in self.metric_functions:
-                metrics.append(func(out, masks).detach())
-            if len(self.metric_functions) == 1:
-                metrics = metrics[0]
-            if not valid:
-                loss.backward()
-        return (images.detach(), masks.detach(), out.detach()),\
-            loss.detach(), metrics
-
-    def train(self, batch):
-        return self.train_or_valid(batch, valid=False)
-
-    def valid(self, batch):
-        return self.train_or_valid(batch, valid=True)
-
-    def test(self, batch):
-        self.model.eval()
-        images = batch['images']
-        if self.use_cuda:
-            images = images.cuda()
-        with torch.no_grad():
-            out = self.model(images)
-        return out
-
-    def step(self, batch):
-        return check_stage(self.stage, train=self.train, test=self.test, valid=self.valid)(batch)
-
-
-class Trainer:
+class Trainer(_Trainer):
 
     def __init__(self, model, optimizer, loss_function, metric_functions,
                  device='cuda', verbose=True):
-        self.train_dataset = get_dataset('train')
-        self.valid_dataset = get_dataset('valid')
-        self.train_loss_logs = {}
-        self.valid_loss_logs = {}
+
+        train_dataset = get_dataset('train')
+        valid_dataset = get_dataset('valid')
+        weights = get_weights(train_dataset)
+        super().__init__(config=CONFIG, train_dataset=train_dataset, valid_dataset=valid_dataset,
+                         inp_index='images', gt_index='masks',
+                         collate_fn=collate_fn, model=model, optimizer=optimizer,
+                         loss_function=loss_function, metric_functions=metric_functions,
+                         samples_weights=weights)
         self.partial_losses_logger = Logger(
             CONFIG, 'partial_losses_logs', create_dir=True)
-        self.main_logger = Logger(CONFIG, 'logs', create_dir=True)
+        self.train_loss_logs = {}
+        self.valid_loss_logs = {}
 
-        self.weights = get_weights(self.train_dataset)
-        self.train_indices, self.valid_indices = get_indices(
-            'train', self.train_dataset, self.weights)
-        self.train_sampler = get_sampler(
-            'train', self.train_dataset, self.weights, self.train_indices)
-        self.valid_sampler = get_sampler(
-            'valid', self.valid_dataset, self.weights, self.valid_indices)
-        self.train_loader = get_loader(
-            'train', self.train_dataset, self.train_sampler)
-        self.valid_loader = get_loader(
-            'valid', self.valid_dataset, self.valid_sampler)
-        self.train_epoch = smp.utils.train.TrainEpoch(
-            model, loss_function, metric_functions, optimizer, device, verbose)
-        self.valid_epoch = smp.utils.train.ValidEpoch(
-            model, loss_function, metric_functions, device, verbose)
-        self.train_step = lambda logs: self.train_epoch.run(
-            self.train_loader, _logs=logs)
-        self.valid_step = lambda logs: self.valid_epoch.run(
-            self.valid_loader, _logs=logs)
-        self.step = lambda logs, valid: self.train_step(
-            logs) if not valid else self.valid_step(logs)
-        self.train_logs = {}
-        self.valid_logs = {}
-
-    def write_logs(self, step, step_logs, valid):
-        logs = self.train_logs
+    def write_logs(self, step_logs, valid):
+        super().write_logs(step_logs, valid)
+        step = self.epoch
         partial_logs = self.train_loss_logs
+        logs = self.train_logs
         if valid:
             logs = self.valid_logs
             partial_logs = self.valid_loss_logs
@@ -450,19 +310,9 @@ class Trainer:
         else:
             self.train_loss_logs = {}
         partial_logs = {key: partial_logs[key].mean for key in partial_logs}
-        logs[step] = {'partial losses': partial_logs, 'main logs': step_logs}
-        self.main_logger.update(
-            step=step, logs=logs[step]['main logs'], valid=valid)
+        logs[step]['partial losses'] = partial_logs
         self.partial_losses_logger.update(
             step, logs[step]['partial losses'], valid=valid)
-
-    @property
-    def optimizer(self):
-        return self.train_epoch.optimizer
-
-    @optimizer.setter
-    def optimizer(self, value):
-        self.train_epoch.optimizer = value
 
     def find_best_binary_thresholds(self):
         masks = []
@@ -491,18 +341,10 @@ class Trainer:
         return {'noise_th': noise_th, 'comp_th': best_thr}
 
 
-class Tester:
+class Tester(_Tester):
     def __init__(self, model, device='cuda'):
-        self.dataset = get_dataset('test')
-        self.indices = get_indices('test', self.dataset, None)
-        self.sampler = get_sampler('test', self.dataset, None, self.indices)
-        self.loader = get_loader('test', self.dataset, self.sampler)
-        self.step = BatchesOperator(
-            'test', model, None, None, device).step
-        self.sigmoid = nn.Sigmoid()
-
-    def predict(self, inputs):
-        return self.sigmoid(self.step(inputs))
+        dataset = get_dataset('test')
+        super().__init__(dataset=dataset, inp_index='images', model=model, device=device)
 
     def compute_rles(self, out, noise_th, best_th, keep_largest, h=1024, w=1024):
         from mask_functions import mask2rle
